@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.env
+logs/
+.venv/
+*.egg-info/
+dist/
+.worktrees/
+
+# Runtime data (contains personal chat history, keys, etc.)
+data/*
+!data/.gitkeep
+
+# Personal style configs (contain real group_ids, wxids)
+styles/groups/*
+!styles/groups/_template.yaml
+styles/contacts/*
+!styles/contacts/_template.yaml
+
+
+# Frontend
+frontend/node_modules/
+
+# Spike scripts (contain personal paths)
+spike/
+frontend/data/
+.claude/

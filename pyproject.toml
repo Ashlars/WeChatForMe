@@ -1,0 +1,35 @@
+[project]
+name = "wechat-agent"
+version = "0.1.0"
+description = "macOS WeChat automation agent powered by Claude API"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "fastapi>=0.116.0",
+    "pyobjc-core>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+    "apscheduler>=3.10.0,<4.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "loguru>=0.7.0",
+    "watchdog>=4.0",
+    "pyobjc-framework-quartz>=12.1",
+    "pyobjc-framework-vision>=12.1",
+    "pycryptodome>=3.23.0",
+    "zstandard>=0.25.0",
+    "uvicorn>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
