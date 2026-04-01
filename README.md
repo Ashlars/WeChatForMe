@@ -43,7 +43,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/WeChatForMe.git
+git clone https://github.com/Ashlars/WeChatForMe.git
 cd WeChatForMe
 
 # Python 依赖
