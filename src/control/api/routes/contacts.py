@@ -39,21 +39,23 @@ def cleanup_contacts(request: Request) -> dict:
                 continue
 
     if removed:
+        ctx = request.app.state.context
         wxids = [r["wxid"] for r in removed]
         placeholders = ",".join("?" * len(wxids))
-        conn.execute(f"DELETE FROM contacts WHERE wxid IN ({placeholders})", wxids)
-        conn.execute(f"DELETE FROM group_members WHERE wxid IN ({placeholders})", wxids)
-        conn.execute(f"DELETE FROM messages WHERE contact_id IN ({placeholders})", wxids)
-        conn.commit()
+        with ctx._lock:
+            conn.execute(f"DELETE FROM contacts WHERE wxid IN ({placeholders})", wxids)
+            conn.execute(f"DELETE FROM group_members WHERE wxid IN ({placeholders})", wxids)
+            conn.execute(f"DELETE FROM messages WHERE contact_id IN ({placeholders})", wxids)
+            conn.commit()
 
     return {"removed": removed, "removed_count": len(removed)}
 
 
 @router.get("", response_model=PaginatedResponse)
-def list_contacts(request: Request) -> PaginatedResponse:
+def list_contacts(request: Request, page: int = 1) -> PaginatedResponse:
     service = ContactService(request.app.state.context)
-    items, total = service.list_contacts()
-    return PaginatedResponse(items=items, total=total)
+    items, total = service.list_contacts(page=page)
+    return PaginatedResponse(items=items, total=total, page=page)
 
 
 @router.patch("/{wxid}")
@@ -69,13 +71,14 @@ def update_contact(wxid: str, patch: ContactPatch, request: Request) -> dict:
 
 @router.delete("/{wxid}")
 def delete_contact(wxid: str, request: Request) -> dict:
-    conn = request.app.state.context._conn
-    contact = request.app.state.context.get_contact(wxid)
+    ctx = request.app.state.context
+    contact = ctx.get_contact(wxid)
     if not contact:
         raise HTTPException(status_code=404, detail="contact_not_found")
-    conn.execute("DELETE FROM contacts WHERE wxid = ?", (wxid,))
-    conn.execute("DELETE FROM group_members WHERE wxid = ?", (wxid,))
-    conn.commit()
+    with ctx._lock:
+        ctx._conn.execute("DELETE FROM contacts WHERE wxid = ?", (wxid,))
+        ctx._conn.execute("DELETE FROM group_members WHERE wxid = ?", (wxid,))
+        ctx._conn.commit()
     return {"deleted": True, "wxid": wxid}
 
 

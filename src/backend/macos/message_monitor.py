@@ -78,6 +78,9 @@ class MessageMonitor:
 
         # Track WAL mtimes
         self._wal_mtimes: dict[str, float] = {}
+        # Track delivered message IDs to avoid duplicates: (username, local_id)
+        # Using dict to preserve insertion order (Python 3.7+)
+        self._delivered_ids: dict[tuple[str, int], None] = {}
 
         # Discover all message DBs with keys
         self._message_dbs: list[str] = [
@@ -143,7 +146,14 @@ class MessageMonitor:
             logger.error("Failed to load contacts: {}", e)
 
     def _init_timestamps(self) -> None:
-        """Initialize last seen timestamps from session.db."""
+        """Initialize last seen timestamps from session.db.
+
+        Subtracts a lookback window to catch messages that arrived
+        before the service started (e.g. during a restart).
+        """
+        import time as _time
+        LOOKBACK_SECONDS = 300  # Re-scan last 5 minutes on startup
+
         key_info = self._keys.get("session/session.db")
         if not key_info:
             return
@@ -156,10 +166,16 @@ class MessageMonitor:
             rows = conn.execute(
                 "SELECT username, last_timestamp FROM SessionTable"
             ).fetchall()
+            now = int(_time.time())
             for r in rows:
-                self._last_timestamps[r["username"]] = r["last_timestamp"]
+                ts = r["last_timestamp"]
+                # For recently active chats, look back to catch missed messages
+                if (now - ts) < LOOKBACK_SECONDS:
+                    self._last_timestamps[r["username"]] = ts - LOOKBACK_SECONDS
+                else:
+                    self._last_timestamps[r["username"]] = ts
             conn.close()
-            logger.debug("Initialized timestamps for {} sessions", len(self._last_timestamps))
+            logger.debug("Initialized timestamps for {} sessions (lookback {}s for recent)", len(self._last_timestamps), LOOKBACK_SECONDS)
         except Exception as e:
             logger.error("Failed to init timestamps: {}", e)
 
@@ -179,29 +195,64 @@ class MessageMonitor:
             try:
                 if poll_count <= 3 or poll_count % 30 == 0:
                     logger.debug("Poll cycle #{}", poll_count)
+                # Refresh contact cache every 5 minutes (150 cycles * 2s)
+                if poll_count % 150 == 0:
+                    try:
+                        self._load_contacts()
+                    except Exception:
+                        logger.exception("Failed to refresh contact cache")
                 self._check_new_messages()
             except Exception as e:
                 logger.exception("Poll error: {}", e)
 
     def _check_new_messages(self) -> None:
-        """Decrypt session.db, find updated chats, fetch new messages."""
+        """Decrypt session.db, find updated chats, fetch new messages.
+
+        Uses two strategies:
+        1. Session-based: check session.db for timestamp changes (catches most messages)
+        2. Active-chat rescan: periodically re-check recently active chats
+           even if session timestamp hasn't changed (catches missed messages)
+        """
         key_info = self._keys.get("session/session.db")
         if not key_info:
             return
 
         db_path = os.path.join(self._db_dir, "session", "session.db")
+        wal_path = db_path + "-wal"
         out_path = os.path.join(self._cache_dir, "session_live.db")
-        decrypt_db_to_file(db_path, key_info["enc_key"], out_path)
 
-        conn = sqlite3.connect(out_path)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT username, last_timestamp, summary, last_msg_sender, "
-            "last_sender_display_name, last_msg_type "
-            "FROM SessionTable WHERE last_timestamp > 0 "
-            "ORDER BY last_timestamp DESC"
-        ).fetchall()
-        conn.close()
+        # Skip decrypt if WAL file hasn't changed (no new writes)
+        try:
+            current_mtime = os.path.getmtime(wal_path) if os.path.exists(wal_path) else os.path.getmtime(db_path)
+        except OSError:
+            current_mtime = 0
+        prev_mtime = self._wal_mtimes.get("session/session.db", 0)
+        if current_mtime == prev_mtime and prev_mtime > 0:
+            return  # No changes since last check
+        self._wal_mtimes["session/session.db"] = current_mtime
+
+        try:
+            decrypt_db_to_file(db_path, key_info["enc_key"], out_path)
+        except Exception as e:
+            logger.debug("Session decrypt failed (WeChat may be writing): {}", e)
+            return
+
+        try:
+            conn = sqlite3.connect(out_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT username, last_timestamp, summary, last_msg_sender, "
+                "last_sender_display_name, last_msg_type "
+                "FROM SessionTable WHERE last_timestamp > 0 "
+                "ORDER BY last_timestamp DESC"
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            logger.debug("Session query failed: {}", e)
+            return
+
+        import time as _time
+        now_ts = int(_time.time())
 
         for r in rows:
             username = r["username"]
@@ -209,8 +260,12 @@ class MessageMonitor:
             prev_ts = self._last_timestamps.get(username, 0)
 
             if ts > prev_ts:
+                # Session timestamp changed — definitely new messages
                 self._last_timestamps[username] = ts
-                # Fetch actual new messages from message DB
+                self._fetch_and_deliver(username, prev_ts)
+            elif ts == prev_ts and (now_ts - ts) < 120:
+                # Same timestamp but recent (< 2 min ago) — re-scan to catch
+                # messages that session.db didn't update timestamp for
                 self._fetch_and_deliver(username, prev_ts)
 
     def _fetch_and_deliver(self, username: str, since_ts: int) -> None:
@@ -244,15 +299,31 @@ class MessageMonitor:
                 found = conn.execute(
                     f"SELECT local_id, create_time, local_type, message_content, "
                     f"real_sender_id FROM [{table_name}] "
-                    f"WHERE create_time > ? ORDER BY create_time ASC",
+                    f"WHERE create_time >= ? ORDER BY create_time ASC",
                     (since_ts,),
                 ).fetchall()
                 conn.close()
                 if found:
-                    rows = found
-                    break  # Found the right DB
+                    rows.extend(found)
             except Exception:
                 continue  # Table not in this DB, try next
+
+        if not rows:
+            return
+
+        # Deduplicate by (username, local_id) — local_id is only unique within a chat table
+        unique_rows = []
+        for r in rows:
+            key = (username, r["local_id"])
+            if key not in self._delivered_ids:
+                self._delivered_ids[key] = None
+                unique_rows.append(r)
+        # Trim oldest entries when too large (dict preserves insertion order)
+        if len(self._delivered_ids) > 5000:
+            keys = list(self._delivered_ids.keys())
+            for k in keys[:2000]:
+                del self._delivered_ids[k]
+        rows = unique_rows
 
         if not rows:
             return
@@ -270,44 +341,97 @@ class MessageMonitor:
 
             content = str(content)
             msg_type = r["local_type"]
-
-            # Skip non-text messages
-            if msg_type != 1:
-                continue
-
+            base_type = msg_type & 0xFFFF if msg_type > 65535 else msg_type
             sender_wxid = r["real_sender_id"] or ""
+            is_self = False
 
-            # Group messages: content = "sender_wxid:\ncontent"
-            # Self-sent group messages have NO prefix — skip them
-            if is_group:
-                if ":\n" in content:
-                    parts = content.split(":\n", 1)
-                    sender_wxid = parts[0]
-                    content = parts[1]
+            # Handle type 49 (app messages — includes reply/quote messages)
+            if base_type == 49:
+                import re
+
+                # For type 49, determine sender from real_sender_id
+                # In groups: real_sender_id is a numeric index, 1 = self
+                if is_group:
+                    is_self = (str(sender_wxid) == "1")
+                    # Try to extract actual wxid from XML
+                    fromusr = re.search(r"<fromusername>(.*?)</fromusername>", content)
+                    if fromusr:
+                        sender_wxid = fromusr.group(1)
+                    elif not is_self:
+                        sender_wxid = str(sender_wxid)
                 else:
-                    # No prefix = self-sent message, skip
+                    is_self = (str(sender_wxid) == "1")
+
+                # Extract reply text from XML <title> tag
+                title_match = re.search(r"<title>(.*?)</title>", content)
+                if not title_match:
+                    continue
+                reply_text = title_match.group(1).strip()
+                if not reply_text:
                     continue
 
-            sender_name = self._contact_cache.get(sender_wxid, sender_wxid)
+                # Check if it's a quote-reply (has <refermsg>)
+                refer_match = re.search(r"<refermsg>.*?<content>(.*?)</content>", content, re.DOTALL)
+                if refer_match:
+                    quoted = refer_match.group(1).strip()[:50]
+                    content = f"「{quoted}」{reply_text}"
+                else:
+                    # Other type-49 (links, files, etc.) — skip non-text ones
+                    if len(reply_text) > 100 or "http" in reply_text:
+                        continue
+                    content = reply_text
+
+            elif base_type == 1:
+                # Plain text: parse sender from content prefix in groups
+                if is_group:
+                    if ":\n" in content:
+                        parts = content.split(":\n", 1)
+                        sender_wxid = parts[0]
+                        content = parts[1]
+                    else:
+                        # No prefix: check real_sender_id to confirm self-sent
+                        # (system messages also lack prefix but have different sender_id)
+                        if str(sender_wxid) == "1":
+                            is_self = True
+                        else:
+                            # System message or other non-human message, skip
+                            continue
+                else:
+                    if str(sender_wxid) == "1":
+                        is_self = True
+            else:
+                # Skip non-text, non-reply messages
+                continue
+
+            sender_name = self._contact_cache.get(sender_wxid, sender_wxid) if not is_self else "__self__"
             group_name = self._contact_cache.get(username, username) if is_group else None
 
             parsed = {
                 "sender_name": sender_name,
-                "sender_id": sender_wxid,
+                "sender_id": sender_wxid if not is_self else "__self__",
                 "content": content,
                 "is_group": is_group,
+                "is_self": is_self,
                 "group_name": group_name,
                 "group_id": username if is_group else None,
+                "chat_wxid": username,  # the conversation partner wxid (private) or group_id
                 "msg_id": str(r["local_id"]),
                 "timestamp": r["create_time"],
             }
 
-            logger.info(
-                "New msg: [{}] {} -> {}",
-                group_name or sender_name,
-                sender_name,
-                content[:50],
-            )
+            if is_self:
+                logger.debug(
+                    "Own msg: [{}] -> {}",
+                    group_name or "私聊",
+                    content[:50],
+                )
+            else:
+                logger.info(
+                    "New msg: [{}] {} -> {}",
+                    group_name or sender_name,
+                    sender_name,
+                    content[:50],
+                )
             self._callback(parsed)
 
     def resolve_name(self, wxid: str) -> str:

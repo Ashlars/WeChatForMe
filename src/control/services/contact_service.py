@@ -12,28 +12,27 @@ class ContactService:
 
     def list_contacts(self, page: int = 1, page_size: int = 20) -> tuple[list[dict], int]:
         rows = self._conn.execute(
-            """SELECT * FROM contacts
-               ORDER BY created_at ASC
+            """SELECT c.*, p.enabled AS pro_enabled, p.topic AS pro_topic
+               FROM contacts c
+               LEFT JOIN proactive_chats p ON c.wxid = p.id
+               ORDER BY c.is_whitelist DESC, c.created_at ASC
                LIMIT ? OFFSET ?""",
             (page_size, (page - 1) * page_size),
         ).fetchall()
         total = self._conn.execute("SELECT COUNT(*) AS count FROM contacts").fetchone()["count"]
-        items = []
-        for row in rows:
-            pro = self._conn.execute(
-                "SELECT enabled, topic FROM proactive_chats WHERE id = ?",
-                (row["wxid"],),
-            ).fetchone()
-            items.append({
+        items = [
+            {
                 "wxid": row["wxid"],
                 "nickname": row["nickname"],
                 "remark": row["remark"],
                 "relationship": row["relationship"],
                 "is_whitelist": bool(row["is_whitelist"]),
                 "is_paused": bool(row["is_paused"]),
-                "proactive_enabled": bool(pro and pro["enabled"]) if pro else False,
-                "proactive_topic": pro["topic"] if pro else None,
-            })
+                "proactive_enabled": bool(row["pro_enabled"]) if row["pro_enabled"] else False,
+                "proactive_topic": row["pro_topic"],
+            }
+            for row in rows
+        ]
         return items, total
 
     def update_contact(self, wxid: str, patch: ContactPatch) -> Contact:
@@ -45,4 +44,13 @@ class ContactService:
         for key, value in changes.items():
             setattr(contact, key, value)
         self._context.save_contact(contact)
+
+        # Sync nickname to all group_members entries for this wxid
+        if "nickname" in changes:
+            self._conn.execute(
+                "UPDATE group_members SET nickname = ? WHERE wxid = ?",
+                (changes["nickname"], wxid),
+            )
+            self._conn.commit()
+
         return self._context.get_contact(wxid) or contact

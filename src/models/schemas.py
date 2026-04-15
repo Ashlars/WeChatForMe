@@ -42,6 +42,7 @@ class Contact(BaseModel):
     style_summary: str | None = None
     interaction_style_summary: str | None = None
     my_alias_for: str | None = None
+    persona_context: str | None = None
     last_analysis_at: datetime | None = None
     created_at: datetime = Field(default_factory=datetime.now)
 
@@ -54,5 +55,6 @@ class Group(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     group_profile: str | None = None
     reply_strategy: str | None = None
+    persona_context: str | None = None
     last_analysis_at: datetime | None = None
     created_at: datetime = Field(default_factory=datetime.now)

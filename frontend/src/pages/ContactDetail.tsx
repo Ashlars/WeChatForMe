@@ -148,6 +148,14 @@ export default function ContactDetail() {
         </div>
 
         <div className="detail-card">
+          <h3>我跟TA聊天时</h3>
+          <p style={{ fontSize: 12, color: '#888', margin: '0 0 8px' }}>定义你跟这个人聊天的范围，会覆盖全局人设</p>
+          <EditableField label="聊天范围" value={(contact as any).persona_context || ''} multiline
+            placeholder="如: 跟TA只聊学术和工作，不聊游戏、不开太大的玩笑"
+            onSave={(v) => api.updateContact(wxid!, { persona_context: v } as any).then(() => api.getContact(wxid!).then(setContact))} />
+        </div>
+
+        <div className="detail-card">
           <h3>画像 & 个性</h3>
           <div className="editable-fields">
             <EditableField label="人物画像" value={contact.persona_summary || ''} multiline placeholder="对方的人物画像描述" onSave={(v) => api.updateContact(wxid!, { persona_summary: v }).then(() => api.getContact(wxid!).then(setContact))} />

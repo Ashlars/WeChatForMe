@@ -61,17 +61,55 @@
 .control-value { font-size: 15px; font-weight: 600; }
 .control-row { display: flex; align-items: center; gap: 8px; }
 
-.label-text-input {
-  padding: 4px 8px;
-  border: 1px solid var(--border);
+.label-current {
+  background: var(--bg);
+  padding: 2px 10px;
   border-radius: 4px;
   font-size: 12px;
-  width: 70px;
-  outline: none;
-  background: var(--bg);
+  color: var(--accent);
+  border: 1px solid var(--border);
 }
 
-.label-text-input:focus { border-color: var(--accent); }
+.label-editor {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.label-editor-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.label-editor-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+}
+
+.label-editor-input {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 13px;
+  width: 160px;
+  outline: none;
+  background: #fff;
+}
+
+.label-editor-input:focus { border-color: var(--accent); }
+
+.label-saved-hint {
+  font-size: 12px;
+  color: var(--success);
+}
 
 .runtime-hint {
   padding: 10px 14px;

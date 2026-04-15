@@ -110,6 +110,13 @@ export default function Groups() {
           ))}
         </tbody>
       </table>
+      {total > 20 && (
+        <div className="pagination">
+          <button disabled={page <= 1} onClick={() => load(page - 1)}>上一页</button>
+          <span>第 {page} 页 / 共 {Math.ceil(total / 20)} 页</span>
+          <button disabled={page * 20 >= total} onClick={() => load(page + 1)}>下一页</button>
+        </div>
+      )}
     </div>
   );
 }

@@ -195,6 +195,67 @@ def test_groups_has_profile_columns(tmp_path):
     ctx.close()
 
 
+def test_save_contact_update_preserves_persona(tmp_path):
+    """UPDATE path should not clobber persona_context (COALESCE)."""
+    db_path = tmp_path / "test.db"
+    ctx = ContextManager(db_path)
+    # Create contact with persona_context
+    c = Contact(wxid="wxid_t1", nickname="Alice", persona_context="只聊技术")
+    ctx.save_contact(c)
+    # Update nickname only — persona_context should survive
+    c2 = ctx.get_contact("wxid_t1")
+    c2.nickname = "Alice2"
+    c2.persona_context = None  # simulate fresh Contact without this field
+    ctx.save_contact(c2)
+    c3 = ctx.get_contact("wxid_t1")
+    assert c3.nickname == "Alice2"
+    assert c3.persona_context == "只聊技术", f"COALESCE failed: {c3.persona_context}"
+    ctx.close()
+
+
+def test_save_group_update_preserves_profile(tmp_path):
+    """UPDATE path should not clobber group_profile/persona_context (COALESCE)."""
+    db_path = tmp_path / "test.db"
+    ctx = ContextManager(db_path)
+    from src.models.schemas import TriggerMode
+    g = Group(group_id="g1", group_name="Test", is_active=True, trigger_mode=TriggerMode.ALL)
+    ctx.save_group(g)
+    # Set profile via SQL
+    ctx._conn.execute("UPDATE groups SET group_profile='fun', persona_context='只聊游戏' WHERE group_id='g1'")
+    ctx._conn.commit()
+    # Update group name — should not clobber profile
+    g2 = ctx.get_group("g1")
+    g2.group_name = "Test2"
+    ctx.save_group(g2)
+    g3 = ctx.get_group("g1")
+    assert g3.group_name == "Test2"
+    assert g3.group_profile == "fun", f"group_profile lost: {g3.group_profile}"
+    assert g3.persona_context == "只聊游戏", f"persona_context lost: {g3.persona_context}"
+    ctx.close()
+
+
+def test_concurrent_save_contact(tmp_path):
+    """Multiple threads saving contacts should not crash."""
+    import threading
+    db_path = tmp_path / "test.db"
+    ctx = ContextManager(db_path)
+    errors = []
+    def writer(i):
+        try:
+            for j in range(20):
+                c = Contact(wxid=f"thread_{i}", nickname=f"name_{i}_{j}")
+                ctx.save_contact(c)
+        except Exception as e:
+            errors.append(str(e))
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(errors) == 0, f"Errors: {errors}"
+    ctx.close()
+
+
 def test_migration_adds_columns_to_existing_db(tmp_path):
     """Verify migration logic adds columns to a database created without them."""
     db_path = tmp_path / "test.db"

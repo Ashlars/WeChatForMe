@@ -10,10 +10,10 @@ router = APIRouter()
 
 
 @router.get("", response_model=PaginatedResponse)
-def list_groups(request: Request) -> PaginatedResponse:
+def list_groups(request: Request, page: int = 1) -> PaginatedResponse:
     service = GroupService(request.app.state.context)
-    items, total = service.list_groups()
-    return PaginatedResponse(items=items, total=total)
+    items, total = service.list_groups(page=page)
+    return PaginatedResponse(items=items, total=total, page=page)
 
 
 @router.patch("/{group_id}")
@@ -29,14 +29,15 @@ def update_group(group_id: str, patch: GroupPatch, request: Request) -> dict:
 
 @router.delete("/{group_id}")
 def delete_group(group_id: str, request: Request) -> dict:
-    conn = request.app.state.context._conn
-    group = request.app.state.context.get_group(group_id)
+    ctx = request.app.state.context
+    group = ctx.get_group(group_id)
     if not group:
         raise HTTPException(status_code=404, detail="group_not_found")
-    conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
-    conn.execute("DELETE FROM group_members WHERE group_id = ?", (group_id,))
-    conn.execute("DELETE FROM proactive_chats WHERE id = ?", (group_id,))
-    conn.commit()
+    with ctx._lock:
+        ctx._conn.execute("DELETE FROM groups WHERE group_id = ?", (group_id,))
+        ctx._conn.execute("DELETE FROM group_members WHERE group_id = ?", (group_id,))
+        ctx._conn.execute("DELETE FROM proactive_chats WHERE id = ?", (group_id,))
+        ctx._conn.commit()
     return {"deleted": True, "group_id": group_id}
 
 

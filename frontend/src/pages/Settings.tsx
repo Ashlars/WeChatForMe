@@ -58,11 +58,13 @@ export default function Settings() {
     try {
       const res = await api.selfAnalyze();
       if (res.updated && res.analysis) {
-        // Reload profile to show updated values
         const updated = await api.getUserProfile();
         setProfile(updated);
         setProfileForm({});
-        setMsg(`自我分析完成！分析了 ${res.messages_analyzed} 条消息，更新了 ${res.updated_fields?.length || 0} 个字段`);
+        const chatInfo = res.chats_analyzed
+          ? `，为 ${res.chats_analyzed} 个群聊设置了聊天范围`
+          : '';
+        setMsg(`分析完成！分析了 ${res.messages_analyzed} 条消息，更新了 ${res.updated_fields?.length || 0} 个固有特征${chatInfo}`);
       } else {
         setMsg(res.error || '分析失败');
       }

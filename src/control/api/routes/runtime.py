@@ -189,113 +189,166 @@ def update_user_profile(body: UserProfileUpdate, request: Request) -> dict:
     return {key: ctx.get_config(key, "") for key, _ in USER_PROFILE_KEYS}
 
 
+def _get_analysis_client(ctx):
+    """Get API client for analysis."""
+    from src.core.llm import get_client_and_model
+    return get_client_and_model(ctx, prefix="analysis")
+
+
+def _call_llm_json(client, model, system: str, prompt: str) -> dict:
+    """Call LLM and parse JSON response."""
+    from src.core.llm import parse_llm_json
+    raw = client.create_message(model=model, max_tokens=1500, system=system,
+                                messages=[{"role": "user", "content": prompt}])
+    return parse_llm_json(raw)
+
+
+def _get_wechat_messages_by_chat(ctx) -> dict[str, list[str]]:
+    """Get real human messages grouped by chat (group_id or 'private')."""
+    try:
+        all_msgs = _fetch_self_messages_from_wechat()
+    except Exception:
+        all_msgs = []
+
+    if not all_msgs:
+        return {}
+
+    # WeChat messages don't have group_id, so return as 'all'
+    return {"_all": [m["content"] for m in all_msgs]}
+
+
 @router.post("/self-analyze")
 def self_analyze(request: Request) -> dict:
-    """Analyze the user's own messages to auto-update persona profile."""
-    import json as json_mod
-    import os
-
-    import anthropic
-
+    """Analyze messages: global persona (fixed traits only) + per-chat context."""
     ctx = request.app.state.context
 
-    # First try: get real human messages from our DB
-    rows = ctx._conn.execute(
-        """SELECT content, group_id, created_at FROM messages
-           WHERE direction = 'outgoing'
-           AND (is_ai_generated = 0 OR is_ai_generated IS NULL)
-           AND agent_model IS NULL
-           AND msg_id NOT LIKE 'out_%'
-           AND msg_id NOT LIKE 'proactive_%'
-           AND length(content) > 2
-           ORDER BY created_at DESC LIMIT 100""",
-    ).fetchall()
+    # Collect messages from WeChat DB
+    try:
+        all_msgs = _fetch_self_messages_from_wechat()
+    except Exception as e:
+        return {"error": f"无法读取微信数据库: {e}", "updated": False}
 
-    # Fallback: read from WeChat encrypted DB directly
-    if not rows:
-        try:
-            rows = _fetch_self_messages_from_wechat()
-        except Exception as e:
-            return {"error": f"没有足够的真人消息，且无法读取微信数据库: {e}", "updated": False}
-
-    if not rows:
+    if not all_msgs:
         return {"error": "没有足够的真人消息用于分析", "updated": False}
 
-    messages_text = "\n".join(
-        f"{'[群聊]' if r['group_id'] else '[私聊]'} {r['content']}"
-        for r in rows
-    )
+    client, model = _get_analysis_client(ctx)
+    all_text = "\n".join(m["content"] for m in all_msgs[:100])
 
-    prompt = f"""分析以下微信聊天记录（全部是同一个人发的），提取这个人的性格、说话风格、习惯等特征。
+    # ── Step 1: Global persona — only FIXED traits across all chats ──
+    global_prompt = f"""分析以下微信聊天记录（全部是同一个人在不同聊天中发的），提取这个人**在所有场合都一致的固有特征**。
 
-聊天记录（共 {len(rows)} 条）:
-{messages_text}
+聊天记录（共 {len(all_msgs[:100])} 条，来自不同的群聊和私聊）:
+{all_text}
 
 请返回以下 JSON 格式:
 {{
-  "user_personality": "性格特点（如：幽默、毒舌、随和）",
-  "user_speaking_style": "说话风格（如：口语化、喜欢反问、简短直接）",
-  "user_habits": "口头禅和习惯用语（如：喜欢用😂、爱说'绝了'）",
-  "user_topics": "感兴趣的话题领域",
-  "user_tone": "语气特征（如：轻松、调侃、不正经）",
-  "user_extra": "其他显著特征"
+  "user_personality": "在所有场合都一致的性格特点",
+  "user_speaking_style": "所有聊天中都有的说话风格（如：口语化、简短直接）",
+  "user_habits": "所有聊天中都用的口头禅和表情（如：😂、绝了）",
+  "user_topics": "不要填，留空字符串",
+  "user_tone": "所有场合都一致的语气基调",
+  "user_extra": "其他所有场合都有的固有特征"
 }}
 
 要求：
-- 从实际聊天内容中归纳，不要编造
-- 描述要具体，有例子支撑
-- 每个字段用简短的中文描述"""
-
-    # Get API config
-    api_key = (
-        ctx.get_config("analysis_api_key", "")
-        or ctx.get_config("chat_api_key", "")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-        or os.environ.get("ANTHROPIC_API_KEY", "")
-    )
-    base_url = (
-        ctx.get_config("analysis_api_base_url", "")
-        or ctx.get_config("chat_api_base_url", "")
-        or os.environ.get("ANTHROPIC_BASE_URL", None)
-    )
-    model = (
-        ctx.get_config("analysis_api_model", "")
-        or ctx.get_config("chat_api_model", "")
-        or os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
-        or "claude-sonnet-4-6"
-    )
+- 只提取在所有聊天中都一致的特征，不要把某个特定场景的行为当成固有特征
+- 比如只在某个群聊足球、只在某个群玩游戏，这些不是固有特征，不要写
+- user_topics 留空，话题因聊天对象不同而不同，不是固有的
+- 描述要具体"""
 
     try:
-        client = anthropic.Anthropic(api_key=api_key, base_url=base_url or None)
-        response = client.messages.create(
-            model=model,
-            max_tokens=1000,
-            system="你是一个聊天风格分析专家。分析用户的聊天记录，提取人格特征。必须返回严格的 JSON。",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.content[0].text.strip()
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-        parsed = json_mod.loads(raw.strip())
+        parsed = _call_llm_json(client, model,
+            "你是聊天风格分析专家。只提取跨所有场合一致的固有特征。必须返回严格的 JSON。",
+            global_prompt)
 
-        # Update profile
+        # Force topics to empty
+        parsed["user_topics"] = ""
+
         updated_fields = []
         for key in ["user_personality", "user_speaking_style", "user_habits", "user_topics", "user_tone", "user_extra"]:
-            if key in parsed and parsed[key]:
+            if key in parsed:
                 ctx.set_config(key, parsed[key])
                 updated_fields.append(key)
 
-        return {
-            "updated": True,
-            "updated_fields": updated_fields,
-            "analysis": parsed,
-            "messages_analyzed": len(rows),
-        }
     except Exception as e:
-        return {"error": str(e), "updated": False}
+        return {"error": f"全局分析失败: {e}", "updated": False}
+
+    # ── Step 2: Per-chat analysis — topics and behavior specific to each chat ──
+    # Get active groups with enough messages
+    groups = ctx._conn.execute(
+        """SELECT g.group_id, g.group_name,
+                  (SELECT COUNT(*) FROM messages m WHERE m.group_id = g.group_id) as msg_count
+           FROM groups g
+           WHERE g.is_active = 1
+           ORDER BY msg_count DESC""",
+    ).fetchall()
+
+    chat_results = []
+    for g in groups:
+        if g["msg_count"] < 5:
+            continue
+
+        # Get recent messages from this group
+        group_msgs = ctx._conn.execute(
+            """SELECT contact_id, direction, content FROM messages
+               WHERE group_id = ? AND length(content) > 2
+               ORDER BY created_at DESC LIMIT 50""",
+            (g["group_id"],),
+        ).fetchall()
+
+        if len(group_msgs) < 5:
+            continue
+
+        group_text = "\n".join(
+            f"[{'我' if m['direction'] == 'outgoing' else '对方'}] {m['content']}"
+            for m in group_msgs
+        )
+
+        chat_prompt = f"""以下是微信群「{g['group_name']}」的聊天记录。分析「我」在这个群里聊什么话题、不聊什么、有什么特别的行为。
+
+聊天记录:
+{group_text}
+
+返回一段简短描述（50字以内），格式如：
+"在这个群主要聊xxx和xxx，不聊xxx，语气偏xxx"
+
+只输出描述文本，不要JSON，不要引号。"""
+
+        try:
+            context_text = client.create_message(
+                model=model, max_tokens=2000,
+                system="分析用户在特定群聊中的行为特征。只输出描述文本。",
+                messages=[{"role": "user", "content": chat_prompt}],
+            ).strip('"').strip("'")
+
+            if context_text and len(context_text) > 5:
+                # Only update if no manual persona_context already set
+                existing = ctx._conn.execute(
+                    "SELECT persona_context FROM groups WHERE group_id = ?",
+                    (g["group_id"],),
+                ).fetchone()
+
+                if not existing or not existing["persona_context"]:
+                    ctx._conn.execute(
+                        "UPDATE groups SET persona_context = ? WHERE group_id = ?",
+                        (context_text, g["group_id"]),
+                    )
+                    ctx._conn.commit()
+                    chat_results.append({
+                        "chat": g["group_name"],
+                        "context": context_text,
+                    })
+        except Exception:
+            continue
+
+    return {
+        "updated": True,
+        "updated_fields": updated_fields,
+        "analysis": parsed,
+        "messages_analyzed": len(all_msgs[:100]),
+        "chat_contexts": chat_results,
+        "chats_analyzed": len(chat_results),
+    }
 
 
 API_CONFIG_KEYS = [

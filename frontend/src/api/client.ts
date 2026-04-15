@@ -87,7 +87,7 @@ export const api = {
     request<{ deleted: boolean }>(`/proactive-chats/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // Self Analysis
-  selfAnalyze: () => request<{ updated: boolean; analysis?: Record<string, string>; messages_analyzed?: number; updated_fields?: string[]; error?: string }>('/runtime/self-analyze', { method: 'POST' }),
+  selfAnalyze: () => request<{ updated: boolean; analysis?: Record<string, string>; messages_analyzed?: number; updated_fields?: string[]; chats_analyzed?: number; error?: string }>('/runtime/self-analyze', { method: 'POST' }),
 
   // User Profile
   getUserProfile: () => request<Record<string, string>>('/runtime/user-profile'),

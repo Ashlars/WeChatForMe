@@ -149,6 +149,14 @@ export default function GroupDetail() {
         </div>
 
         <div className="detail-card">
+          <h3>我在这个群里</h3>
+          <p style={{ fontSize: 12, color: '#888', margin: '0 0 8px' }}>定义你在这个群的聊天范围，会覆盖全局人设中相应部分</p>
+          <EditableField label="聊天范围" value={(group as any).persona_context || ''} multiline
+            placeholder="如: 这个群只聊足球和日常，不聊技术、不聊游戏、不聊工作"
+            onSave={(v) => api.updateGroup(groupId!, { persona_context: v } as any).then(() => api.getGroup(groupId!).then(setGroup))} />
+        </div>
+
+        <div className="detail-card">
           <h3>主动聊天</h3>
           <div className="proactive-toggle">
             <span>开启主动聊天</span>

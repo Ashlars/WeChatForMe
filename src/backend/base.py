@@ -12,8 +12,10 @@ class IncomingMessage:
     sender_id: str
     content: str
     is_group: bool
+    is_self: bool = False
     group_id: str | None = None
     group_name: str | None = None
+    chat_wxid: str | None = None  # conversation partner wxid (private) or group_id
     msg_id: str | None = None
     timestamp: datetime = field(default_factory=datetime.now)
 

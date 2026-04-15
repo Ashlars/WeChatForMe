@@ -54,6 +54,9 @@ def create_control_app(
         @app.get("/{path:path}")
         async def serve_spa(path: str):
             """Serve the SPA index.html for all non-API routes."""
+            from fastapi import HTTPException
+            if path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="not_found")
             return FileResponse(str(static_dir / "index.html"))
 
     return app

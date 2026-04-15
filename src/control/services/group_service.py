@@ -12,31 +12,31 @@ class GroupService:
 
     def list_groups(self, page: int = 1, page_size: int = 20) -> tuple[list[dict], int]:
         rows = self._conn.execute(
-            """SELECT * FROM groups
-               ORDER BY created_at ASC
+            """SELECT g.*, p.enabled AS pro_enabled, p.topic AS pro_topic
+               FROM groups g
+               LEFT JOIN proactive_chats p ON g.group_id = p.id
+               ORDER BY g.is_active DESC, g.created_at ASC
                LIMIT ? OFFSET ?""",
             (page_size, (page - 1) * page_size),
         ).fetchall()
         total = self._conn.execute("SELECT COUNT(*) AS count FROM groups").fetchone()["count"]
         items = []
         for row in rows:
-            group = self._context.get_group(row["group_id"])
-            # Check proactive chat status
-            pro = self._conn.execute(
-                "SELECT enabled, topic, interval_minutes FROM proactive_chats WHERE id = ?",
-                (row["group_id"],),
-            ).fetchone()
-            items.append(
-                {
-                    "group_id": row["group_id"],
-                    "group_name": row["group_name"],
-                    "is_active": bool(row["is_active"]),
-                    "trigger_mode": row["trigger_mode"],
-                    "keywords": group.keywords if group else [],
-                    "proactive_enabled": bool(pro and pro["enabled"]) if pro else False,
-                    "proactive_topic": pro["topic"] if pro else None,
-                }
-            )
+            import json
+            raw_kw = row["keywords"] or "[]"
+            try:
+                keywords = json.loads(raw_kw)
+            except (json.JSONDecodeError, TypeError):
+                keywords = []
+            items.append({
+                "group_id": row["group_id"],
+                "group_name": row["group_name"],
+                "is_active": bool(row["is_active"]),
+                "trigger_mode": row["trigger_mode"],
+                "keywords": keywords,
+                "proactive_enabled": bool(row["pro_enabled"]) if row["pro_enabled"] else False,
+                "proactive_topic": row["pro_topic"],
+            })
         return items, total
 
     def update_group(self, group_id: str, patch: GroupPatch) -> Group:

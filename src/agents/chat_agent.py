@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import threading
 import time
 import uuid
-from collections import defaultdict
-
-import os
+from datetime import datetime as dt
 
 import anthropic
 from loguru import logger
 
 from src.backend.base import IncomingMessage, WeChatBackend
 from src.core.config import ConfigManager
+from src.models.schemas import Contact as ContactModel, Group as GroupModel
 from src.core.context import ContextManager
 from src.core.security import SecurityManager
 from src.core.style import StyleManager
@@ -49,8 +50,6 @@ class ChatAgent:
         self._group_collect_window = config.get("reply_rules.group_chat.collect_window", 10)
         self._group_max_reply_length = config.get("reply_rules.group_chat.max_reply_length", 200)
 
-        self._forbidden_patterns = style_manager.get_chat_rules().get("forbidden_patterns", [])
-
         # Group message batching state
         self._collect_timers: dict[str, threading.Timer] = {}
         self._collect_lock = threading.Lock()
@@ -66,13 +65,40 @@ class ChatAgent:
             logger.exception("Error handling message from {}", msg.sender_name)
 
     def _handle_message_inner(self, msg: IncomingMessage) -> None:
-        # Always save message to DB
+        # Self-sent messages: save as outgoing, don't trigger reply
+        if msg.is_self:
+            # For private chats, use the conversation partner's wxid as contact_id
+            # so the message shows up in the right conversation history.
+            # For groups, use __self__.
+            chat_wxid = msg.chat_wxid
+            private_contact_id = chat_wxid if (chat_wxid and not msg.is_group) else "__self__"
+            self._context.save_message(Message(
+                msg_id=msg.msg_id or f"self_{uuid.uuid4().hex[:12]}",
+                contact_id="__self__" if msg.is_group else private_contact_id,
+                group_id=msg.group_id,
+                direction=MessageDirection.OUTGOING,
+                content=msg.content,
+                created_at=msg.timestamp,
+            ))
+            # Still ensure group record exists
+            if msg.is_group and msg.group_id:
+
+                if not self._context.get_group(msg.group_id):
+                    self._context.save_group(GroupModel(
+                        group_id=msg.group_id,
+                        group_name=msg.group_name,
+                        is_active=False,
+                    ))
+            return
+
+        # Incoming: save and process
         self._context.save_message(Message(
             msg_id=msg.msg_id or f"in_{uuid.uuid4().hex[:12]}",
             contact_id=msg.sender_id,
             group_id=msg.group_id,
             direction=MessageDirection.INCOMING,
             content=msg.content,
+            created_at=msg.timestamp,
         ))
 
         # Auto-create contact/group records if not exists
@@ -103,7 +129,9 @@ class ChatAgent:
         if msg.is_group:
             self._enqueue_group_reply(msg)
         else:
-            self._do_reply(msg)
+            # Run in background thread to avoid blocking the message monitor
+            t = threading.Thread(target=self._do_reply, args=[msg], daemon=True)
+            t.start()
 
     # ── group message batching ───────────────────────────────────
 
@@ -156,7 +184,7 @@ class ChatAgent:
             label = self._context.get_config("ai_label_text", "[AI]")
             send_text = f"{label} {reply}"
 
-        target = msg.group_name if msg.is_group else msg.sender_name
+        target = self._resolve_target(msg)
         success = self._backend.send_message(target, send_text)
 
         if success:
@@ -167,6 +195,20 @@ class ChatAgent:
                 group_id=msg.group_id,
                 direction=MessageDirection.OUTGOING,
                 content=reply,
+                agent_model=self._chat_model,
+            ))
+        else:
+            logger.error(
+                "Failed to send reply to {} (target: '{}'), message lost: {}",
+                msg.sender_name, target, reply[:50],
+            )
+            # Save as failed message for potential manual retry
+            self._context.save_message(Message(
+                msg_id=f"fail_{uuid.uuid4().hex[:12]}",
+                contact_id="__self__" if msg.is_group else msg.sender_id,
+                group_id=msg.group_id,
+                direction=MessageDirection.OUTGOING,
+                content=f"[发送失败] {reply}",
                 agent_model=self._chat_model,
             ))
 
@@ -275,18 +317,17 @@ class ChatAgent:
                 msg.sender_id, is_group=msg.is_group,
                 group_id=msg.group_id, group_name=msg.group_name,
             )
-            messages = self._build_messages(history, msg.content, is_group=msg.is_group)
+            messages = self._build_messages(history, msg.content, is_group=msg.is_group, group_id=msg.group_id)
 
             client, model = self._get_client_and_model()
             logger.info("Calling API ({}) with {} history messages", model, len(history))
-            response = client.messages.create(
+            reply = client.create_message(
                 model=model,
-                max_tokens=max_len * 2,
+                max_tokens=max(max_len * 2, 2000),
                 system=system_prompt,
                 messages=messages,
             )
-            reply = response.content[0].text
-            logger.info("Claude replied: {}", reply[:100])
+            logger.info("LLM replied: {}", reply[:100])
             return self._clean_response(
                 reply, contact_id=msg.sender_id, group_id=msg.group_id,
             )
@@ -294,28 +335,9 @@ class ChatAgent:
             logger.exception("Failed to generate reply")
             return None
 
-    def _build_user_persona(self) -> str:
-        """Build user persona description from DB config."""
-        aliases = self._context.get_config("user_aliases", "")
-
-        fields = [
-            ("user_personality", "性格"),
-            ("user_speaking_style", "说话风格"),
-            ("user_habits", "口头禅和习惯"),
-            ("user_topics", "感兴趣的话题"),
-            ("user_tone", "语气特征"),
-            ("user_extra", "补充"),
-        ]
-        lines = []
-        if aliases:
-            lines.append(f"- 别人可能叫你: {aliases}（这些都是在叫你，要回应）")
-        for key, label in fields:
-            val = self._context.get_config(key, "")
-            if val:
-                lines.append(f"- {label}: {val}")
-        if not lines:
-            return ""
-        return "【你的人设（必须严格模仿）】\n" + "\n".join(lines) + "\n"
+    def _build_user_persona(self, *, persona_context: str | None = None) -> str:
+        from src.core.llm import build_user_persona
+        return build_user_persona(self._context, persona_context=persona_context)
 
     def _build_system_prompt(
         self,
@@ -330,111 +352,171 @@ class ChatAgent:
         )
         contact = self._context.get_contact(contact_id) if contact_id else None
         relationship = contact.relationship if contact else "朋友"
-        user_persona = self._build_user_persona()
         user_nick = self._context.get_config("user_nickname", "") or self._user_name
+
+        # Get per-chat persona context
+        chat_persona_context = None
+        if is_group and group_id:
+            group_obj = self._context.get_group(group_id)
+            if group_obj and group_obj.persona_context:
+                chat_persona_context = group_obj.persona_context
+        elif contact and contact.persona_context:
+            chat_persona_context = contact.persona_context
+
+        user_persona = self._build_user_persona(persona_context=chat_persona_context)
+
+        # AI label context — let the model know what the label means
+        ai_label_hint = ""
+        if self._context.get_config("ai_label_enabled", "0") == "1":
+            label_text = self._context.get_config("ai_label_text", "[AI]")
+            ai_label_hint = f"\n注意：你发送的消息前面会被自动加上「{label_text}」标识，这是系统加的，你不需要自己加。如果聊天记录里看到带「{label_text}」前缀的消息，那就是你之前说的话。\n"
 
         if is_group:
             members_prompt = self._build_members_prompt(group_id) if group_id else ""
-            return f"""你是{user_nick}，正在微信群「{group_name or '群聊'}」里聊天。
+            user_aliases = self._context.get_config("user_aliases", "")
+            alias_warning = ""
+            if user_aliases:
+                alias_warning = f"\n- 「{user_aliases}」是别人叫你的称呼，绝对不要用这些去叫别人"
 
-{user_persona}【最重要】区分不同的人：
-- 消息格式为「[昵称] 内容」，不同的昵称是不同的人
+            return f"""你是{user_nick}本人，不是AI，不是机器人，不是助手。你就是{user_nick}。
+正在微信群「{group_name or '群聊'}」里聊天。不要提及或混入其他群或私聊的内容。
+
+【绝对禁止】
+- 绝对不能说自己是AI、机器人、人工智能、语言模型或程序
+- 别人问"你是不是AI"、"你是机器人吗"时，根据情况否认、反问或调侃（如"你才是AI"、"我要是AI还能跟你在这扯淡？"）
+- 别人问"你是谁"时，用{user_nick}的身份自然回答，可以调侃对方
+- 不要说任何暴露AI身份的话（如"作为…"、"我没有感情"、"我的知识截止…"）
+{ai_label_hint}
+{user_persona}【最重要 — 人物识别与称呼】
+- 消息格式为「[昵称] 内容」，不同的昵称是不同的人，绝对不能搞混
 - [{user_nick}(你自己)] 开头的是你之前说过的话
-- 你必须清楚是谁在跟你说话，不要把 A 说的话当成 B 说的
-- 回复时要针对正确的人
+- 你必须清楚每条消息是谁说的，不要把 A 说的话当成 B 说的
+- 如果成员画像里写了「我叫TA: xxx」，提到这个人时用这个称呼
+- 但不是每句话都要叫名字，大部分时候直接说事情就行，像真人一样自然
+- 严禁张冠李戴：不要把甲的话当成乙说的{alias_warning}
 
 核心要求：
 1. 针对别人刚说的话来回应，不要自说自话
 2. 像真人一样接话、附和、反驳、追问
-3. 根据每个人的特点，用不同方式回应不同的人
-4. 只输出回复内容，不要任何前缀或标记
-5. 一次只回复一条消息，简短自然
+3. 同一个人连发多条消息，当作一段话理解，只回复一条
+4. 不需要一条一条对应回复，整体理解后回一条就行
+5. 不要每句话都带表情/emoji，大部分时候纯文字就行，偶尔用一个
+6. 只输出回复内容，不要任何前缀或标记
+7. 一次只回复一条消息，简短自然
 
 {members_prompt}【严格遵守以下聊天规则】:
 {style_prompt}"""
         else:
-            return f"""你是{user_nick}，正在用微信和{relationship}聊天。
+            # Get alias for this contact
+            contact_alias = ""
+            if contact and contact.my_alias_for:
+                contact_alias = f"\n- 你叫对方「{contact.my_alias_for}」，但不用每句话都叫，大部分时候直接说事情"
 
+            return f"""你是{user_nick}本人，不是AI。正在用微信和{relationship}私聊。
+不要提及或混入群聊或跟其他人的对话内容。
+
+【绝对禁止】
+- 不能说自己是AI、机器人或程序，别人问就否认或调侃
+- 不要说暴露AI身份的话
+{ai_label_hint}
 {user_persona}核心要求：
 1. 针对对方刚说的话来回应，不要自说自话
 2. 像真人聊天一样，接住对方的话，自然回复
-3. 只输出回复内容，不要任何解释或前缀
+3. 对方连发多条消息当作一段话理解，只回一条
+4. 不要每句话都带表情，大部分时候纯文字，偶尔用一个
+5. 只输出回复内容，不要任何解释或前缀{contact_alias}
 
 【严格遵守以下聊天规则】:
 {style_prompt}"""
 
     def _build_messages(
-        self, history: list[Message], current_content: str, *, is_group: bool = False,
+        self, history: list[Message], current_content: str, *, is_group: bool = False, group_id: str | None = None,
     ) -> list[dict]:
+        """Build messages for API call.
+
+        All messages are shown as a single chronological chat log.
+        The model sees who said what, including its own previous replies.
+        Newer messages are closer to the end = higher weight.
+        """
         messages: list[dict] = []
 
         if is_group:
-            # Split history into older context and recent new messages to reply to
-            # Find the last message we sent — everything after it is "new"
-            last_our_idx = -1
-            for i, msg in enumerate(history):
-                if msg.direction == MessageDirection.OUTGOING:
-                    last_our_idx = i
-
-            if last_our_idx >= 0 and last_our_idx < len(history) - 1:
-                context_msgs = history[:last_our_idx + 1]
-                new_msgs = history[last_our_idx + 1:]
-            else:
-                # No outgoing message in history, or it's the last one
-                # Use all but the latest few as context
-                split = max(0, len(history) - 5)
-                context_msgs = history[:split]
-                new_msgs = history[split:]
+            # Batch-resolve all sender names to avoid N+1 queries
+            sender_cache: dict[str, str] = {}
+            for m in history:
+                if m.direction != MessageDirection.OUTGOING and m.contact_id not in sender_cache:
+                    sender_cache[m.contact_id] = self._resolve_sender(m.contact_id, group_id=group_id)
 
             def format_msg(msg: Message) -> str:
                 if msg.direction == MessageDirection.OUTGOING:
                     return f"[{self._user_name}(你自己)] {msg.content}"
-                sender = self._resolve_sender(msg.contact_id)
-                return f"[{sender}] {msg.content}"
+                return f"[{sender_cache.get(msg.contact_id, msg.contact_id)}] {msg.content}"
 
-            # Build context block
-            context_lines = [format_msg(m) for m in context_msgs]
+            all_lines = [format_msg(m) for m in history]
 
-            if context_lines:
-                messages.append({
-                    "role": "user",
-                    "content": "以下是之前的群聊记录（作为背景参考）。注意：方括号里是发言者的名字，不同的名字是不同的人：\n" + "\n".join(context_lines),
-                })
-                messages.append({
-                    "role": "assistant",
-                    "content": "好的，我了解上下文了，我会注意区分不同的人。",
-                })
+            if all_lines:
+                last_our_idx = -1
+                for i, msg in enumerate(history):
+                    if msg.direction == MessageDirection.OUTGOING:
+                        last_our_idx = i
 
-            # Build the "new messages to reply to" block
-            new_lines = [format_msg(m) for m in new_msgs]
-
-            if new_lines:
-                # Identify unique senders in new messages
                 new_senders = []
-                for m in new_msgs:
+                start = last_our_idx + 1 if last_our_idx >= 0 else 0
+                for m in history[start:]:
                     if m.direction != MessageDirection.OUTGOING:
-                        name = self._resolve_sender(m.contact_id)
+                        name = sender_cache.get(m.contact_id, m.contact_id)
                         if name not in new_senders:
                             new_senders.append(name)
 
-                sender_hint = f"（发言者: {', '.join(new_senders)}）" if new_senders else ""
+                sender_hint = f"最新发言者: {', '.join(new_senders)}" if new_senders else ""
+
                 messages.append({
                     "role": "user",
-                    "content": f"以下是刚发的新消息{sender_hint}，注意区分每个人，针对性地回复:\n" + "\n".join(new_lines),
+                    "content": (
+                        f"以下是群聊的完整聊天记录（从旧到新，共{len(all_lines)}条）。"
+                        f"方括号里是发言者名字，不同名字是不同的人。"
+                        f"带(你自己)的是你之前说的话。\n"
+                        f"{sender_hint}\n\n"
+                        + "\n".join(all_lines)
+                        + "\n\n请根据以上对话，自然地回复最新的消息。"
+                    ),
                 })
             else:
                 messages.append({
                     "role": "user",
-                    "content": f"对方刚说了: {current_content}\n请针对这句话回复。",
+                    "content": f"对方刚说了: {current_content}\n请回复。",
                 })
         else:
-            # Private chat: standard alternating user/assistant
+            # Private chat: resolve contact name once, not per message
+            other_name = "对方"
+            other_ids = {m.contact_id for m in history if m.direction != MessageDirection.OUTGOING}
+            if other_ids:
+                cobj = self._context.get_contact(next(iter(other_ids)))
+                if cobj:
+                    other_name = cobj.my_alias_for or cobj.remark or cobj.nickname or "对方"
+
+            all_lines = []
             for msg in history:
-                role = "assistant" if msg.direction == MessageDirection.OUTGOING else "user"
-                messages.append({"role": role, "content": msg.content})
-            # Ensure last message is from the other person
-            if not messages or messages[-1]["role"] != "user":
-                messages.append({"role": "user", "content": current_content})
+                if msg.direction == MessageDirection.OUTGOING:
+                    all_lines.append(f"[你] {msg.content}")
+                else:
+                    all_lines.append(f"[{other_name}] {msg.content}")
+
+            if all_lines:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"以下是你和对方的聊天记录（从旧到新，共{len(all_lines)}条）。"
+                        f"[你]是你之前说的话，另一个名字是对方。\n\n"
+                        + "\n".join(all_lines)
+                        + "\n\n请根据以上对话，自然地回复对方最新的消息。"
+                    ),
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"对方刚说了: {current_content}\n请回复。",
+                })
 
         return messages
 
@@ -442,11 +524,14 @@ class ChatAgent:
         """Build a prompt section describing known group members, merging contact data."""
         rows = self._context._conn.execute(
             """SELECT gm.nickname, gm.role, gm.personality, gm.style_notes, gm.notes,
-                      c.relationship, c.persona_summary, c.style_summary, c.interaction_style_summary
+                      gm.my_alias_for AS gm_alias,
+                      c.relationship, c.persona_summary, c.style_summary, c.interaction_style_summary,
+                      c.my_alias_for AS c_alias, c.remark AS c_remark
                FROM group_members gm
                LEFT JOIN contacts c ON gm.wxid = c.wxid
                WHERE gm.group_id = ?
                AND (gm.role != '' OR gm.personality != '' OR gm.style_notes != '' OR gm.notes != ''
+                    OR gm.my_alias_for != '' OR c.my_alias_for IS NOT NULL
                     OR c.relationship IS NOT NULL OR c.persona_summary IS NOT NULL
                     OR c.style_summary IS NOT NULL)""",
             (group_id,),
@@ -456,16 +541,17 @@ class ChatAgent:
 
         lines = ["【群成员画像（根据每个人的特点调整回复方式）】"]
         for r in rows:
-            name = r["nickname"] or "未知"
+            # Resolve display name: prefer alias → remark → nickname
+            gm_alias = r["gm_alias"] or ""
+            c_alias = r["c_alias"] or ""
+            c_remark = r["c_remark"] or ""
+            nickname = r["nickname"] or "未知"
+            my_name_for = gm_alias or c_alias
+            name = c_remark or nickname
+
             parts = []
-            # My alias for this person
-            my_alias = None
-            try:
-                my_alias = r["my_alias_for"]
-            except (IndexError, KeyError):
-                pass
-            if my_alias:
-                parts.append(f"我叫TA: {my_alias}")
+            if my_name_for:
+                parts.append(f"我叫TA: {my_name_for}")
             # Group-level info
             if r["role"]:
                 parts.append(f"群内身份: {r['role']}")
@@ -489,36 +575,41 @@ class ChatAgent:
         lines.append("")
         return "\n".join(lines) + "\n"
 
-    def _resolve_sender(self, wxid: str) -> str:
-        """Try to resolve wxid to a display name."""
+    def _resolve_target(self, msg: IncomingMessage) -> str:
+        """Resolve the latest name for sending a message. Always reads from DB to avoid stale names."""
+        if msg.is_group and msg.group_id:
+            group = self._context.get_group(msg.group_id)
+            if group and group.group_name:
+                return group.group_name
+            return msg.group_name or msg.group_id
+        else:
+            contact = self._context.get_contact(msg.sender_id)
+            if contact:
+                return contact.remark or contact.nickname or msg.sender_name
+            return msg.sender_name
+
+    def _resolve_sender(self, wxid: str, group_id: str | None = None) -> str:
+        """Resolve wxid to display name. Prioritizes: group_member alias → contact alias → remark → nickname."""
+        # Check group-specific alias first
+        if group_id:
+            row = self._context._conn.execute(
+                "SELECT my_alias_for, nickname FROM group_members WHERE group_id = ? AND wxid = ?",
+                (group_id, wxid),
+            ).fetchone()
+            if row and row["my_alias_for"]:
+                return row["my_alias_for"]
+
+        # Then check contact-level alias
         contact = self._context.get_contact(wxid)
         if contact:
-            return contact.remark or contact.nickname or wxid
+            return contact.my_alias_for or contact.remark or contact.nickname or wxid
         return wxid
 
     # ── helpers ───────────────────────────────────────────────────
 
     def _get_client_and_model(self) -> tuple[anthropic.Anthropic, str]:
-        """Get API client and model, reading DB config with env var fallback."""
-        api_key = (
-            self._context.get_config("chat_api_key", "")
-            or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-            or os.environ.get("ANTHROPIC_API_KEY", "")
-        )
-        base_url = (
-            self._context.get_config("chat_api_base_url", "")
-            or os.environ.get("ANTHROPIC_BASE_URL", None)
-        )
-        model = (
-            self._context.get_config("chat_api_model", "")
-            or os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
-            or self._chat_model
-        )
-        client = anthropic.Anthropic(
-            api_key=api_key,
-            base_url=base_url or None,
-        )
-        return client, model
+        from src.core.llm import get_client_and_model
+        return get_client_and_model(self._context, prefix="chat", default_model=self._chat_model)
 
     def _clean_response(
         self, text: str, *, contact_id: str | None = None, group_id: str | None = None,
@@ -532,45 +623,54 @@ class ChatAgent:
 
     def _ensure_records(self, msg: IncomingMessage) -> None:
         """Auto-create contact/group DB records for new senders."""
-        import re
 
         # Skip invalid wxids (pure numbers)
         if re.fullmatch(r"\d+", msg.sender_id):
             return
 
-        # Ensure contact exists
-        if not self._context.get_contact(msg.sender_id):
-            from src.models.schemas import Contact as ContactModel
+        # Ensure contact exists, update nickname if changed
+        existing_contact = self._context.get_contact(msg.sender_id)
+        if not existing_contact:
             self._context.save_contact(ContactModel(
                 wxid=msg.sender_id,
                 nickname=msg.sender_name,
                 is_whitelist=False,
             ))
             logger.info("Auto-created contact: {} ({})", msg.sender_name, msg.sender_id)
+        elif msg.sender_name and existing_contact.nickname != msg.sender_name:
+            old_nick = existing_contact.nickname
+            existing_contact.nickname = msg.sender_name
+            self._context.save_contact(existing_contact)
+            logger.debug("Updated contact nickname: {} -> {}", old_nick, msg.sender_name)
 
-        # Ensure group exists
+        # Ensure group exists, update group_name if changed
         if msg.is_group and msg.group_id:
-            from src.models.schemas import Group as GroupModel
-            if not self._context.get_group(msg.group_id):
+            existing_group = self._context.get_group(msg.group_id)
+            if not existing_group:
                 self._context.save_group(GroupModel(
                     group_id=msg.group_id,
                     group_name=msg.group_name,
                     is_active=False,
                 ))
                 logger.info("Auto-created group: {} ({})", msg.group_name, msg.group_id)
+            elif msg.group_name and existing_group.group_name != msg.group_name:
+                # Group was renamed in WeChat — update our DB
+                existing_group.group_name = msg.group_name
+                self._context.save_group(existing_group)
+                logger.info("Updated group name: {} -> {}", existing_group.group_name, msg.group_name)
 
             # Track group member
-            from datetime import datetime as dt
-            self._context._conn.execute(
-                """INSERT INTO group_members (group_id, wxid, nickname, msg_count, last_msg_at)
-                   VALUES (?, ?, ?, 1, ?)
-                   ON CONFLICT(group_id, wxid) DO UPDATE SET
-                   nickname = excluded.nickname,
-                   msg_count = msg_count + 1,
-                   last_msg_at = excluded.last_msg_at""",
-                (msg.group_id, msg.sender_id, msg.sender_name, dt.now().isoformat()),
-            )
-            self._context._conn.commit()
+            with self._context._lock:
+                self._context._conn.execute(
+                    """INSERT INTO group_members (group_id, wxid, nickname, msg_count, last_msg_at)
+                       VALUES (?, ?, ?, 1, ?)
+                       ON CONFLICT(group_id, wxid) DO UPDATE SET
+                       nickname = excluded.nickname,
+                       msg_count = msg_count + 1,
+                       last_msg_at = excluded.last_msg_at""",
+                    (msg.group_id, msg.sender_id, msg.sender_name, dt.now().isoformat()),
+                )
+                self._context._conn.commit()
 
     def _handle_pause(self, msg: IncomingMessage) -> None:
         contact = self._context.get_contact(msg.sender_id)

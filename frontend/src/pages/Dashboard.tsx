@@ -6,7 +6,8 @@ import './Pages.css';
 export default function Dashboard() {
   const [data, setData] = useState<DashboardSummary | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
-
+  const [labelDraft, setLabelDraft] = useState('');
+  const [labelSaved, setLabelSaved] = useState(false);
   const load = () => {
     api.getDashboard().then(setData);
     api.getRuntimeStatus().then(setRuntime);
@@ -30,15 +31,20 @@ export default function Dashboard() {
     setRuntime({ ...runtime, ai_label_enabled: res.ai_label_enabled, ai_label_text: res.ai_label_text });
   };
 
-  const saveLabelText = async (text: string) => {
-    if (!runtime) return;
-    const res = await api.setAiLabel({ label_text: text });
+  const saveLabelText = async () => {
+    if (!runtime || !labelDraft.trim()) return;
+    const res = await api.setAiLabel({ label_text: labelDraft.trim() });
     setRuntime({ ...runtime, ai_label_text: res.ai_label_text });
+    setLabelDraft('');
+    setLabelSaved(true);
+    setTimeout(() => setLabelSaved(false), 2000);
   };
 
   if (!data || !runtime) return <div className="loading">加载中...</div>;
 
   const runtimeRunning = runtime.runtime_process === 'running';
+  const currentLabel = runtime.ai_label_text || '[AI]';
+  const hasChange = labelDraft.trim() !== '' && labelDraft.trim() !== currentLabel;
 
   const stats = [
     { label: '白名单联系人', value: data.whitelist_count },
@@ -94,19 +100,29 @@ export default function Dashboard() {
                 {runtime.ai_label_enabled ? '已开启' : '已关闭'}
               </button>
               {runtime.ai_label_enabled && (
-                <input
-                  className="label-text-input"
-                  value={runtime.ai_label_text || '[AI]'}
-                  onChange={(e) => setRuntime({ ...runtime, ai_label_text: e.target.value })}
-                  onBlur={(e) => saveLabelText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-                  placeholder="标识内容"
-                />
+                <code className="label-current">{currentLabel}</code>
               )}
             </div>
           </div>
         </div>
       </div>
+
+      {runtime.ai_label_enabled && (
+        <div className="label-editor">
+          <span className="label-editor-hint">修改标识内容</span>
+          <div className="label-editor-row">
+            <input
+              className="label-editor-input"
+              value={labelDraft}
+              onChange={(e) => setLabelDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && hasChange) saveLabelText(); }}
+              placeholder={currentLabel}
+            />
+            <button className="btn-sm" onClick={saveLabelText} disabled={!hasChange}>保存</button>
+          </div>
+          {labelSaved && <span className="label-saved-hint">已保存</span>}
+        </div>
+      )}
 
       {!runtimeRunning && (
         <div className="runtime-hint">

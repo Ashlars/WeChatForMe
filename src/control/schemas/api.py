@@ -22,6 +22,7 @@ class ContactPatch(BaseModel):
     style_summary: str | None = None
     interaction_style_summary: str | None = None
     my_alias_for: str | None = None
+    persona_context: str | None = None
 
 
 class GroupPatch(BaseModel):
@@ -31,3 +32,4 @@ class GroupPatch(BaseModel):
     keywords: list[str] | None = Field(default=None)
     group_profile: str | None = None
     reply_strategy: str | None = None
+    persona_context: str | None = None

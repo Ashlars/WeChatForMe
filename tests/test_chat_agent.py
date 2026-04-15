@@ -20,16 +20,19 @@ def test_build_system_prompt():
 
 def test_build_messages_for_api():
     agent = ChatAgent.__new__(ChatAgent)
+    agent._user_name = "小明"
+    agent._context = MagicMock()
+    agent._context.get_contact.return_value = None
     history = [
         Message(msg_id="1", contact_id="wxid_abc", direction=MessageDirection.INCOMING, content="你好"),
         Message(msg_id="2", contact_id="wxid_abc", direction=MessageDirection.OUTGOING, content="你好呀"),
     ]
     api_messages = agent._build_messages(history, "最近怎么样")
-    assert len(api_messages) == 3
+    # Now uses single-message chronological format
+    assert len(api_messages) == 1
     assert api_messages[0]["role"] == "user"
-    assert api_messages[1]["role"] == "assistant"
-    assert api_messages[2]["role"] == "user"
-    assert api_messages[2]["content"] == "最近怎么样"
+    assert "你好" in api_messages[0]["content"]
+    assert "你好呀" in api_messages[0]["content"]
 
 
 def test_clean_response():

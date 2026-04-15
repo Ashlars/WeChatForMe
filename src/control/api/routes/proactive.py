@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -37,30 +39,32 @@ def get_proactive_chat(chat_id: str, request: Request) -> dict:
 
 @router.put("/{chat_id:path}")
 def upsert_proactive_chat(chat_id: str, body: ProactiveChatConfig, request: Request) -> dict:
-    conn = request.app.state.context._conn
-    from datetime import datetime
-    conn.execute(
-        """INSERT OR REPLACE INTO proactive_chats
-           (id, chat_type, chat_name, enabled, interval_minutes, topic, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, COALESCE(
-               (SELECT created_at FROM proactive_chats WHERE id = ?),
-               ?
-           ))""",
-        (
-            chat_id, body.chat_type, body.chat_name,
-            body.enabled, body.interval_minutes, body.topic,
-            chat_id, datetime.now().isoformat(),
-        ),
-    )
-    conn.commit()
-    return dict(conn.execute(
+    ctx = request.app.state.context
+    with ctx._lock:
+        ctx._conn.execute(
+            """INSERT OR REPLACE INTO proactive_chats
+               (id, chat_type, chat_name, enabled, interval_minutes, topic, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, COALESCE(
+                   (SELECT created_at FROM proactive_chats WHERE id = ?),
+                   ?
+               ))""",
+            (
+                chat_id, body.chat_type, body.chat_name,
+                body.enabled, body.interval_minutes, body.topic,
+                chat_id, datetime.now().isoformat(),
+            ),
+        )
+        ctx._conn.commit()
+    row = ctx._conn.execute(
         "SELECT * FROM proactive_chats WHERE id = ?", (chat_id,)
-    ).fetchone())
+    ).fetchone()
+    return dict(row)
 
 
 @router.delete("/{chat_id:path}")
 def delete_proactive_chat(chat_id: str, request: Request) -> dict:
-    conn = request.app.state.context._conn
-    conn.execute("DELETE FROM proactive_chats WHERE id = ?", (chat_id,))
-    conn.commit()
+    ctx = request.app.state.context
+    with ctx._lock:
+        ctx._conn.execute("DELETE FROM proactive_chats WHERE id = ?", (chat_id,))
+        ctx._conn.commit()
     return {"deleted": True}

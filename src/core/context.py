@@ -11,11 +11,14 @@ from src.models.schemas import Contact, Group, Message, MessageDirection, Trigge
 
 class ContextManager:
     def __init__(self, db_path: Path) -> None:
+        import threading
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
 
     def _create_tables(self) -> None:
@@ -173,6 +176,13 @@ class ContextManager:
             except sqlite3.OperationalError:
                 pass
 
+        # Add persona_context column (per-chat persona override)
+        for tbl in ["contacts", "groups"]:
+            try:
+                self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN persona_context TEXT")
+            except sqlite3.OperationalError:
+                pass
+
         # Add my_alias_for column to contacts (what I call them)
         try:
             self._conn.execute("ALTER TABLE contacts ADD COLUMN my_alias_for TEXT")
@@ -198,19 +208,20 @@ class ContextManager:
         self._conn.commit()
 
     def save_message(self, msg: Message) -> None:
-        try:
-            is_ai = 1 if msg.agent_model else 0
-            self._conn.execute(
-                """INSERT OR IGNORE INTO messages
-                   (msg_id, contact_id, group_id, direction, content, msg_type, agent_model, is_ai_generated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (msg.msg_id, msg.contact_id, msg.group_id, msg.direction.value,
-                 msg.content, msg.msg_type, msg.agent_model, is_ai,
-                 msg.created_at.isoformat()),
-            )
-            self._conn.commit()
-        except sqlite3.Error as e:
-            logger.error("Failed to save message {}: {}", msg.msg_id, e)
+        with self._lock:
+            try:
+                is_ai = 1 if msg.agent_model else 0
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO messages
+                       (msg_id, contact_id, group_id, direction, content, msg_type, agent_model, is_ai_generated, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (msg.msg_id, msg.contact_id, msg.group_id, msg.direction.value,
+                     msg.content, msg.msg_type, msg.agent_model, is_ai,
+                     msg.created_at.isoformat()),
+                )
+                self._conn.commit()
+            except sqlite3.Error as e:
+                logger.error("Failed to save message {}: {}", msg.msg_id, e)
 
     def get_recent_messages(
         self, contact_id: str, *, group_id: str | None = None, limit: int = 20
@@ -272,36 +283,60 @@ class ContextManager:
         ]
 
     def save_contact(self, contact: Contact) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO contacts
-               (wxid, nickname, remark, relationship, chat_prefs,
-                is_whitelist, is_paused, last_interaction, my_alias_for, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (contact.wxid, contact.nickname, contact.remark,
-             contact.relationship,
-             json.dumps(contact.chat_prefs) if contact.chat_prefs else None,
-             contact.is_whitelist, contact.is_paused,
-             contact.last_interaction.isoformat() if contact.last_interaction else None,
-             contact.my_alias_for,
-             contact.created_at.isoformat()),
-        )
-        self._conn.commit()
+        with self._lock:
+            existing = self._conn.execute("SELECT wxid FROM contacts WHERE wxid = ?", (contact.wxid,)).fetchone()
+            if existing:
+                self._conn.execute(
+                    """UPDATE contacts SET nickname=?, remark=?, relationship=?, chat_prefs=?,
+                       is_whitelist=?, is_paused=?, last_interaction=?, my_alias_for=?,
+                       persona_context=COALESCE(?, persona_context)
+                       WHERE wxid=?""",
+                    (contact.nickname, contact.remark, contact.relationship,
+                     json.dumps(contact.chat_prefs) if contact.chat_prefs else None,
+                     contact.is_whitelist, contact.is_paused,
+                     contact.last_interaction.isoformat() if contact.last_interaction else None,
+                     contact.my_alias_for, contact.persona_context, contact.wxid),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO contacts
+                       (wxid, nickname, remark, relationship, chat_prefs,
+                        is_whitelist, is_paused, last_interaction, my_alias_for, persona_context, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (contact.wxid, contact.nickname, contact.remark, contact.relationship,
+                     json.dumps(contact.chat_prefs) if contact.chat_prefs else None,
+                     contact.is_whitelist, contact.is_paused,
+                     contact.last_interaction.isoformat() if contact.last_interaction else None,
+                     contact.my_alias_for, contact.persona_context, contact.created_at.isoformat()),
+                )
+            self._conn.commit()
 
     def save_group(self, group: Group) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO groups
-               (group_id, group_name, is_active, trigger_mode, keywords, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                group.group_id,
-                group.group_name,
-                group.is_active,
-                group.trigger_mode.value,
-                json.dumps(group.keywords),
-                group.created_at.isoformat(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            existing = self._conn.execute("SELECT group_id FROM groups WHERE group_id = ?", (group.group_id,)).fetchone()
+            if existing:
+                self._conn.execute(
+                    """UPDATE groups SET group_name=?, is_active=?, trigger_mode=?, keywords=?,
+                       group_profile=COALESCE(?, group_profile),
+                       reply_strategy=COALESCE(?, reply_strategy),
+                       persona_context=COALESCE(?, persona_context)
+                       WHERE group_id=?""",
+                    (group.group_name, group.is_active, group.trigger_mode.value,
+                     json.dumps(group.keywords),
+                     group.group_profile, group.reply_strategy, group.persona_context,
+                     group.group_id),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO groups
+                       (group_id, group_name, is_active, trigger_mode, keywords,
+                        group_profile, reply_strategy, persona_context, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (group.group_id, group.group_name, group.is_active, group.trigger_mode.value,
+                     json.dumps(group.keywords), group.group_profile, group.reply_strategy,
+                     group.persona_context, group.created_at.isoformat()),
+                )
+            self._conn.commit()
 
     def get_contact(self, wxid: str) -> Contact | None:
         row = self._conn.execute(
@@ -310,12 +345,14 @@ class ContextManager:
         if not row:
             return None
         prefs = json.loads(row["chat_prefs"]) if row["chat_prefs"] else None
+        keys = row.keys()
         return Contact(
             wxid=row["wxid"], nickname=row["nickname"], remark=row["remark"],
             relationship=row["relationship"], chat_prefs=prefs,
             is_whitelist=bool(row["is_whitelist"]),
             is_paused=bool(row["is_paused"]),
-            my_alias_for=row["my_alias_for"] if "my_alias_for" in row.keys() else None,
+            my_alias_for=row["my_alias_for"] if "my_alias_for" in keys else None,
+            persona_context=row["persona_context"] if "persona_context" in keys else None,
         )
 
     def get_whitelist_contacts(self) -> list[Contact]:
@@ -344,12 +381,17 @@ class ContextManager:
         except json.JSONDecodeError:
             keywords = [k.strip() for k in raw_keywords.split(",") if k.strip()]
 
+        keys = row.keys()
         return Group(
             group_id=row["group_id"],
             group_name=row["group_name"],
             is_active=bool(row["is_active"]),
             trigger_mode=TriggerMode(row["trigger_mode"] or "at_me"),
             keywords=keywords,
+            group_profile=row["group_profile"] if "group_profile" in keys else None,
+            reply_strategy=row["reply_strategy"] if "reply_strategy" in keys else None,
+            persona_context=row["persona_context"] if "persona_context" in keys else None,
+            last_analysis_at=row["last_analysis_at"] if "last_analysis_at" in keys else None,
         )
 
     def get_config(self, key: str, default: str = "") -> str:

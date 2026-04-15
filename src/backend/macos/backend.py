@@ -41,8 +41,10 @@ class MacOSBackend(WeChatBackend):
             sender_id=str(parsed["sender_id"]),
             content=parsed["content"],
             is_group=parsed["is_group"],
+            is_self=parsed.get("is_self", False),
             group_name=parsed.get("group_name"),
             group_id=parsed.get("group_id"),
+            chat_wxid=parsed.get("chat_wxid"),
             msg_id=parsed.get("msg_id", f"db_{uuid.uuid4().hex[:12]}"),
             timestamp=datetime.fromtimestamp(parsed["timestamp"])
             if isinstance(parsed.get("timestamp"), (int, float))

@@ -94,22 +94,23 @@ def update_group_member(group_id: str, wxid: str, body: MemberPatch, request: Re
     group_changes = {k: v for k, v in changes.items() if k in group_fields}
     contact_changes = {contact_fields[k]: v for k, v in changes.items() if k in contact_fields}
 
-    if group_changes:
-        set_clause = ", ".join(f"{k} = ?" for k in group_changes)
-        conn.execute(
-            f"UPDATE group_members SET {set_clause} WHERE group_id = ? AND wxid = ?",
-            list(group_changes.values()) + [group_id, wxid],
-        )
-
-    if contact_changes:
-        # Ensure contact exists
-        contact_row = conn.execute("SELECT wxid FROM contacts WHERE wxid = ?", (wxid,)).fetchone()
-        if contact_row:
-            set_clause = ", ".join(f"{k} = ?" for k in contact_changes)
+    ctx = request.app.state.context
+    with ctx._lock:
+        if group_changes:
+            set_clause = ", ".join(f"{k} = ?" for k in group_changes)
             conn.execute(
-                f"UPDATE contacts SET {set_clause} WHERE wxid = ?",
-                list(contact_changes.values()) + [wxid],
+                f"UPDATE group_members SET {set_clause} WHERE group_id = ? AND wxid = ?",
+                list(group_changes.values()) + [group_id, wxid],
             )
 
-    conn.commit()
+        if contact_changes:
+            contact_row = conn.execute("SELECT wxid FROM contacts WHERE wxid = ?", (wxid,)).fetchone()
+            if contact_row:
+                set_clause = ", ".join(f"{k} = ?" for k in contact_changes)
+                conn.execute(
+                    f"UPDATE contacts SET {set_clause} WHERE wxid = ?",
+                    list(contact_changes.values()) + [wxid],
+                )
+
+        conn.commit()
     return _merge_member_contact(conn, group_id, wxid)
